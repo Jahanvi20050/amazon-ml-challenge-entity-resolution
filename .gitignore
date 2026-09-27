@@ -1,0 +1,11 @@
+# Data & Outputs
+dataset/
+output/
+mini_dataset/
+*.tsv
+
+# Python cache & bytecode
+__pycache__/
+*.pyc
+utils/__pycache__/
+code/business_entity_resolution/src/__pycache__/
