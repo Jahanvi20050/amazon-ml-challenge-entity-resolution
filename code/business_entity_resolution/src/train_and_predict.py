@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Main Training and Inference Script for Multilingual Entity Resolution.
+Enhanced Main Training and Inference Script for Multilingual Entity Resolution.
 1. Splits train_source1 into 80% train and 20% validation.
-2. Runs blocking (FAISS + SentenceTransformers) to retrieve candidate pairs.
-3. Builds pair similarity features.
-4. Trains LightGBMClassifier.
-5. Calibrates probability threshold on 20% validation split specifically to maximize Macro F_0.5.
+2. Runs Hybrid Blocking (Dense FAISS + Sparse TF-IDF N-grams).
+3. Extracts 16 pairwise similarity features.
+4. Trains an Ensemble GBDT Classifier (LightGBM + HistGradientBoosting).
+5. Grid-searches optimal probability threshold specifically to maximize Macro F_0.5.
 6. Runs inference on test dataset.
 7. Exports output/candidate_pairs.tsv and output/matching_results.tsv.
 8. Runs local validation via utils/validate_submission.py.
@@ -18,12 +18,13 @@ import subprocess
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
+from sklearn.ensemble import HistGradientBoostingClassifier
 from lightgbm import LGBMClassifier
 
 # Import pipeline modules
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from preprocessing import preprocess_dataframe
-from blocking import SentenceTransformerBlocker, export_candidate_pairs_tsv
+from blocking import HybridBlocker, export_candidate_pairs_tsv
 from feature_engineering import build_feature_matrix
 
 
@@ -99,7 +100,7 @@ def calibrate_threshold(
     Returns optimal threshold and best Macro F_0.5 score.
     """
     print("[Calibration] Grid searching threshold for Macro F_0.5...")
-    thresholds = np.linspace(0.10, 0.95, 86)
+    thresholds = np.linspace(0.10, 0.99, 90)
     best_thresh = 0.5
     best_score = -1.0
 
@@ -107,11 +108,8 @@ def calibrate_threshold(
     val_pair_info['prob'] = val_probs
 
     for thresh in thresholds:
-        # Filter predictions above threshold
         passed = val_pair_info[val_pair_info['prob'] >= thresh]
         pred_dict = passed.groupby('source1_entity_id')['candidate_entity_id'].apply(set).to_dict()
-
-        # Compute Macro F_0.5 score
         score = compute_macro_f05(val_s1_ids, pred_dict, ground_truth_dict)
 
         if score > best_score:
@@ -136,7 +134,7 @@ def export_matching_results_tsv(predictions_dict: dict, s1_all_ids: list, output
 
 
 def run_pipeline(project_root: str):
-    print(f"=== Multilingual Entity Resolution Pipeline ===")
+    print(f"=== Multilingual Entity Resolution Pipeline (Enhanced SOTA) ===")
     print(f"Project Root: {project_root}")
 
     # Paths
@@ -161,25 +159,25 @@ def run_pipeline(project_root: str):
     df_s2 = preprocess_dataframe(df_s2)
     df_s3 = preprocess_dataframe(df_s3)
 
-    # 2. Train / Validation Split (80% Train, 20% Validation on Source 1)
+    # 2. Train / Validation Split (80% Train, 20% Validation)
     s1_all_ids = df_s1['entity_id'].tolist()
     train_s1_ids, val_s1_ids = train_test_split(s1_all_ids, test_size=0.20, random_state=42)
 
     df_s1_train = df_s1[df_s1['entity_id'].isin(set(train_s1_ids))].copy()
     df_s1_val = df_s1[df_s1['entity_id'].isin(set(val_s1_ids))].copy()
 
-    # 3. Blocking
-    print("[2/6] Running FAISS Multilingual Embedding Blocking...")
-    blocker = SentenceTransformerBlocker()
-    
-    print("Generating train candidate pairs...")
-    train_candidates = blocker.generate_candidate_pairs(df_s1_train, df_s2, df_s3, top_k=35)
+    # 3. Hybrid Blocking (Dense FAISS + Sparse TF-IDF N-grams)
+    print("[2/6] Running Hybrid Dense FAISS + Sparse TF-IDF Blocking...")
+    blocker = HybridBlocker()
+
+    print("Generating train candidate pairs (Hybrid Dense + Sparse)...")
+    train_candidates = blocker.generate_candidate_pairs(df_s1_train, df_s2, df_s3, top_k_dense=30, top_k_sparse=20)
 
     print("Generating validation candidate pairs...")
-    val_candidates = blocker.generate_candidate_pairs(df_s1_val, df_s2, df_s3, top_k=35)
+    val_candidates = blocker.generate_candidate_pairs(df_s1_val, df_s2, df_s3, top_k_dense=30, top_k_sparse=20)
 
-    # 4. Feature Engineering
-    print("[3/6] Extracting Pair Similarity Features...")
+    # 4. Feature Engineering (16 Features)
+    print("[3/6] Extracting 16 Pair Similarity Features...")
     s1_dict = df_s1.set_index('entity_id').to_dict('index')
     df_cand = pd.concat([df_s2, df_s3], ignore_index=True)
     cand_dict = df_cand.set_index('entity_id').to_dict('index')
@@ -190,23 +188,40 @@ def run_pipeline(project_root: str):
     print(f"Train samples: {len(X_train)} (Positive ratio: {y_train.mean():.4f})")
     print(f"Validation samples: {len(X_val)} (Positive ratio: {y_val.mean():.4f})")
 
-    # 5. Model Training & Validation Calibration
-    print("[4/6] Training LightGBM Classifier...")
-    model = LGBMClassifier(
-        n_estimators=300,
-        learning_rate=0.05,
-        max_depth=6,
-        num_leaves=31,
+    # 5. Model Training & Ensemble Blending
+    print("[4/6] Training Ensemble Classifiers (LightGBM + HistGradientBoosting)...")
+    
+    # Model 1: LightGBM
+    lgb_model = LGBMClassifier(
+        n_estimators=400,
+        learning_rate=0.03,
+        max_depth=7,
+        num_leaves=63,
         random_state=42,
         class_weight='balanced',
         n_jobs=-1
     )
-    model.fit(X_train, y_train)
+    lgb_model.fit(X_train, y_train)
 
-    val_probs = model.predict_proba(X_val)[:, 1]
+    # Model 2: HistGradientBoosting
+    hgb_model = HistGradientBoostingClassifier(
+        max_iter=400,
+        learning_rate=0.03,
+        max_depth=7,
+        random_state=42,
+        class_weight='balanced'
+    )
+    hgb_model.fit(X_train, y_train)
+
+    # Ensemble Prediction
+    val_probs_lgb = lgb_model.predict_proba(X_val)[:, 1]
+    val_probs_hgb = hgb_model.predict_proba(X_val)[:, 1]
+    val_probs = 0.5 * val_probs_lgb + 0.5 * val_probs_hgb
+
+    # Calibrate Threshold
     best_thresh, best_val_macro_f05 = calibrate_threshold(val_s1_ids, val_pair_info, val_probs, gt_dict)
 
-    # 6. Test Set Inference or Full Dataset Predictions
+    # 6. Test Set Inference
     print("[5/6] Running Test Inference...")
     test_s1_path = os.path.join(test_dir, "test_source1.tsv")
     test_s2_path = os.path.join(test_dir, "test_source2.tsv")
@@ -224,7 +239,7 @@ def run_pipeline(project_root: str):
         df_test_s3 = df_s3
 
     test_s1_all_ids = df_test_s1['entity_id'].tolist()
-    test_candidates = blocker.generate_candidate_pairs(df_test_s1, df_test_s2, df_test_s3, top_k=35)
+    test_candidates = blocker.generate_candidate_pairs(df_test_s1, df_test_s2, df_test_s3, top_k_dense=30, top_k_sparse=20)
 
     test_s1_dict = df_test_s1.set_index('entity_id').to_dict('index')
     df_test_cand = pd.concat([df_test_s2, df_test_s3], ignore_index=True)
@@ -236,8 +251,10 @@ def run_pipeline(project_root: str):
     cand_pairs_out = os.path.join(output_dir, "candidate_pairs.tsv")
     export_candidate_pairs_tsv(test_candidates, cand_pairs_out)
 
-    # Predict test matches with calibrated threshold
-    test_probs = model.predict_proba(X_test)[:, 1]
+    # Predict test matches with ensemble
+    test_probs_lgb = lgb_model.predict_proba(X_test)[:, 1]
+    test_probs_hgb = hgb_model.predict_proba(X_test)[:, 1]
+    test_probs = 0.5 * test_probs_lgb + 0.5 * test_probs_hgb
     test_pair_info['prob'] = test_probs
 
     test_passed = test_pair_info[test_pair_info['prob'] >= best_thresh]
@@ -251,7 +268,6 @@ def run_pipeline(project_root: str):
     print("[6/6] Executing Submission Validation...")
     val_script = os.path.join(project_root, "utils", "validate_submission.py")
     if not os.path.exists(val_script):
-        # Fallback to current working directory utils/validate_submission.py
         val_script = os.path.join(os.getcwd(), "utils", "validate_submission.py")
 
     if os.path.exists(val_script):
@@ -265,12 +281,10 @@ def run_pipeline(project_root: str):
             print("=== Validation Failed! Check error log. ===")
             sys.exit(1)
     else:
-        print(f"[Warning] Validation script not found at {val_script}. Skipping local validation step.")
-
+        print(f"[Warning] Validation script not found at {val_script}. Skipping validation.")
 
 
 if __name__ == "__main__":
-    # Determine project root directory
     script_dir = os.path.dirname(os.path.abspath(__file__))
     project_root = os.path.abspath(os.path.join(script_dir, "..", "..", ".."))
     run_pipeline(project_root)
